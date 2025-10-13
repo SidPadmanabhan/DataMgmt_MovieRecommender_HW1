@@ -27,6 +27,13 @@ from typing import Dict, List, Tuple, Optional
 import sys
 import statistics
 
+
+def _strip_inline_comment(line: str) -> str:
+    """Return the part of the line before a '#' comment (inline or full-line)."""
+    if '#' in line:
+        return line.split('#', 1)[0]
+    return line
+
 # -------------------------------
 # Data structures
 # -------------------------------
@@ -69,6 +76,7 @@ class DataStore:
 # Parsing helpers
 # -------------------------------
 
+
 def load_movies_file(path: str, store: DataStore) -> int:
     """Load a movies file into the DataStore.
     
@@ -82,6 +90,7 @@ def load_movies_file(path: str, store: DataStore) -> int:
     Notes:
         - Lines that do not have exactly 3 fields are skipped.
         - Leading/trailing whitespace around fields is stripped.
+        - Inline '#' comments are allowed and ignored.
         - Duplicate movie_name rows will overwrite previous entries (last one wins).
     """
     count = 0
@@ -90,8 +99,8 @@ def load_movies_file(path: str, store: DataStore) -> int:
 
     with open(path, "r", encoding="utf-8") as f:
         for lineno, raw in enumerate(f, start=1):
-            line = raw.strip()
-            if not line or line.startswith("#"):
+            line = _strip_inline_comment(raw).strip()
+            if not line:
                 continue
             parts = line.split("|")
             if len(parts) != 3:
@@ -115,24 +124,25 @@ def load_ratings_file(path: str, store: DataStore) -> int:
         store: The shared DataStore instance to populate.
     
     Returns:
-        The number of valid rating rows loaded.
+        The number of unique (user_id, movie_name) rating pairs loaded after applying
+        last-write-wins on duplicates.
     
     Notes:
         - Lines that do not have exactly 3 fields are skipped.
         - Ratings must be parseable as float in [0, 5] inclusive; else skipped.
-        - If the movie_name is not present in the loaded movies list, the rating is still
-          accepted (some datasets separate these), but such movies won't appear in
-          genre-based features unless the movies file is consistent.
-        - Each user can rate a movie at most once; later duplicate lines for the same
-          (user, movie) overwrite the previous rating (last one wins).
+        - Inline comments after a '#' are ignored.
+        - We keep ratings for movies not present in the movies file *only* in user_ratings
+          (so they count toward the returned total), but we exclude them from
+          ratings_by_movie so they do not affect popularity/genre analytics.
+        - If a user rates the same movie multiple times, the last one wins.
     """
     store.ratings_by_movie.clear()
     store.user_ratings.clear()
-    count = 0
+
     with open(path, "r", encoding="utf-8") as f:
         for lineno, raw in enumerate(f, start=1):
-            line = raw.strip()
-            if not line or line.startswith("#"):
+            line = _strip_inline_comment(raw).strip()
+            if not line:
                 continue
             parts = line.split("|")
             if len(parts) != 3:
@@ -144,16 +154,19 @@ def load_ratings_file(path: str, store: DataStore) -> int:
                 continue
             if not (0.0 <= rating <= 5.0):
                 continue
-            # Update user_ratings (overwrite if exists to enforce one rating per movie per user)
+            # Overwrite if the same user re-rates the same movie (last wins)
             store.user_ratings.setdefault(user_id, {})[movie_name] = rating
-            count += 1
 
-    # Build ratings_by_movie from user_ratings to ensure uniqueness per user/movie
+    # Build ratings_by_movie from user_ratings (only for movies present in movies file)
+    store.ratings_by_movie.clear()
     for user_id, per_user in store.user_ratings.items():
         for movie_name, rating in per_user.items():
-            store.ratings_by_movie.setdefault(movie_name, []).append(rating)
+            if movie_name in store.movies_by_name:
+                store.ratings_by_movie.setdefault(movie_name, []).append(rating)
 
-    return count
+    # Return number of unique (user, movie) pairs across *all* ratings (including unknown movies)
+    unique_pairs = sum(len(per_user) for per_user in store.user_ratings.values())
+    return unique_pairs
 
 
 # -------------------------------
