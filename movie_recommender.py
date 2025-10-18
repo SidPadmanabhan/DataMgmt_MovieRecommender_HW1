@@ -19,6 +19,8 @@ Features implemented (with menu options):
 6) Recommend movies for a user: 3 most popular movies from the user's top genre that the user has not yet rated
 
 Python 3.12 compatible.
+
+Now with case-insensitive handling for movie names and genres.
 """
 
 from __future__ import annotations
@@ -27,12 +29,16 @@ from typing import Dict, List, Tuple, Optional
 import sys
 import statistics
 
+# -------------------------------
+# Utilities
+# -------------------------------
 
 def _strip_inline_comment(line: str) -> str:
     """Return the part of the line before a '#' comment (inline or full-line)."""
     if '#' in line:
         return line.split('#', 1)[0]
     return line
+
 
 # -------------------------------
 # Data structures
@@ -43,9 +49,9 @@ class Movie:
     """Represents a movie loaded from the movies file.
     
     Attributes:
-        genre: The single genre to which this movie belongs.
+        genre: The single genre to which this movie belongs (original casing).
         movie_id: The ID string (not used in calculations but preserved).
-        name: The movie's name including year (unique per title-year pair).
+        name: The movie's name including year (original casing).
     """
     genre: str
     movie_id: str
@@ -55,11 +61,16 @@ class Movie:
 class DataStore:
     """Holds all loaded data and provides lookup dictionaries.
     
+    Case-insensitive policy:
+      - Keys in movies_by_name, movies_by_genre, ratings_by_movie, and user_ratings
+        use *lowercased* movie names and genres.
+      - The Movie objects preserve original casing for display.
+    
     Attributes:
-        movies_by_name: Maps movie_name -> Movie
-        movies_by_genre: Maps genre -> set of movie_names
-        ratings_by_movie: Maps movie_name -> list of float ratings
-        user_ratings: Maps user_id -> {movie_name: rating}
+        movies_by_name: Maps lower(movie_name) -> Movie
+        movies_by_genre: Maps lower(genre) -> set of lower(movie_name)
+        ratings_by_movie: Maps lower(movie_name) -> list of float ratings
+        user_ratings: Maps user_id -> {lower(movie_name): rating}
     """
     def __init__(self) -> None:
         self.movies_by_name: Dict[str, Movie] = {}
@@ -76,23 +87,8 @@ class DataStore:
 # Parsing helpers
 # -------------------------------
 
-
 def load_movies_file(path: str, store: DataStore) -> int:
-    """Load a movies file into the DataStore.
-    
-    Args:
-        path: Path to the movies file (pipe-delimited with 'genre|movie_id|movie_name').
-        store: The shared DataStore instance to populate.
-    
-    Returns:
-        The number of valid movie rows loaded.
-    
-    Notes:
-        - Lines that do not have exactly 3 fields are skipped.
-        - Leading/trailing whitespace around fields is stripped.
-        - Inline '#' comments are allowed and ignored.
-        - Duplicate movie_name rows will overwrite previous entries (last one wins).
-    """
+    """Load a movies file into the DataStore (case-insensitive keys)."""
     count = 0
     store.movies_by_name.clear()
     store.movies_by_genre.clear()
@@ -110,31 +106,18 @@ def load_movies_file(path: str, store: DataStore) -> int:
             if not genre or not movie_id or not movie_name:
                 continue
             m = Movie(genre=genre, movie_id=movie_id, name=movie_name)
-            store.movies_by_name[movie_name] = m
-            store.movies_by_genre.setdefault(genre, set()).add(movie_name)
+            key_name = movie_name.lower()
+            key_genre = genre.lower()
+            store.movies_by_name[key_name] = m
+            store.movies_by_genre.setdefault(key_genre, set()).add(key_name)
             count += 1
     return count
 
 
 def load_ratings_file(path: str, store: DataStore) -> int:
-    """Load a ratings file into the DataStore.
+    """Load a ratings file into the DataStore (case-insensitive keys).
     
-    Args:
-        path: Path to the ratings file (pipe-delimited with 'movie_name|rating|user_id').
-        store: The shared DataStore instance to populate.
-    
-    Returns:
-        The number of unique (user_id, movie_name) rating pairs loaded after applying
-        last-write-wins on duplicates.
-    
-    Notes:
-        - Lines that do not have exactly 3 fields are skipped.
-        - Ratings must be parseable as float in [0, 5] inclusive; else skipped.
-        - Inline comments after a '#' are ignored.
-        - We keep ratings for movies not present in the movies file *only* in user_ratings
-          (so they count toward the returned total), but we exclude them from
-          ratings_by_movie so they do not affect popularity/genre analytics.
-        - If a user rates the same movie multiple times, the last one wins.
+    Returns the number of unique (user_id, movie_name) pairs after last-write-wins.
     """
     store.ratings_by_movie.clear()
     store.user_ratings.clear()
@@ -154,15 +137,15 @@ def load_ratings_file(path: str, store: DataStore) -> int:
                 continue
             if not (0.0 <= rating <= 5.0):
                 continue
-            # Overwrite if the same user re-rates the same movie (last wins)
-            store.user_ratings.setdefault(user_id, {})[movie_name] = rating
+            # Store user rating using lowercased movie key
+            store.user_ratings.setdefault(user_id, {})[movie_name.lower()] = rating
 
     # Build ratings_by_movie from user_ratings (only for movies present in movies file)
     store.ratings_by_movie.clear()
     for user_id, per_user in store.user_ratings.items():
-        for movie_name, rating in per_user.items():
-            if movie_name in store.movies_by_name:
-                store.ratings_by_movie.setdefault(movie_name, []).append(rating)
+        for movie_key, rating in per_user.items():
+            if movie_key in store.movies_by_name:
+                store.ratings_by_movie.setdefault(movie_key, []).append(rating)
 
     # Return number of unique (user, movie) pairs across *all* ratings (including unknown movies)
     unique_pairs = sum(len(per_user) for per_user in store.user_ratings.values())
@@ -174,11 +157,18 @@ def load_ratings_file(path: str, store: DataStore) -> int:
 # -------------------------------
 
 def movie_average_rating(store: DataStore, movie_name: str) -> Optional[float]:
-    """Compute the average rating for a single movie, or None if unrated."""
-    ratings = store.ratings_by_movie.get(movie_name, [])
+    """Compute the average rating for a single movie (name matching is case-insensitive)."""
+    key = movie_name.lower()
+    ratings = store.ratings_by_movie.get(key, [])
     if not ratings:
         return None
     return statistics.fmean(ratings)
+
+
+def _display_name(store: DataStore, movie_key: str) -> Optional[str]:
+    """Get display name (original casing) for a lowercased movie key."""
+    m = store.movies_by_name.get(movie_key)
+    return m.name if m else None
 
 
 def rank_movies_by_average(
@@ -190,42 +180,41 @@ def rank_movies_by_average(
     
     Args:
         store: DataStore with ratings.
-        movie_names: If provided, restrict ranking to this list; if None, consider all
-                     movies that have at least one rating.
+        movie_names: If provided, restrict ranking to this list (movie names, any case).
+                     If None, consider all movies that have at least one rating.
         n: If provided, return only the top n.
     
     Returns:
-        A list of tuples: (movie_name, average_rating, num_ratings), sorted by:
+        A list of tuples: (movie_name_display, average_rating, num_ratings), sorted by:
             - average_rating desc
             - num_ratings desc
-            - movie_name asc (for tie-breaking)
+            - movie_name (display) asc (for tie-breaking, compared case-insensitively)
     """
     items: List[Tuple[str, float, int]] = []
-    # determine candidate set
-    candidates = movie_names if movie_names is not None else list(store.ratings_by_movie.keys())
-    for name in candidates:
-        ratings = store.ratings_by_movie.get(name, [])
+    # Determine candidate set of keys (lowercased)
+    if movie_names is None:
+        candidates = list(store.ratings_by_movie.keys())
+    else:
+        candidates = [name.lower() for name in movie_names]
+
+    for key in candidates:
+        ratings = store.ratings_by_movie.get(key, [])
         if not ratings:
             continue
         avg = statistics.fmean(ratings)
-        items.append((name, avg, len(ratings)))
+        disp = _display_name(store, key)
+        if not disp:
+            continue
+        items.append((disp, avg, len(ratings)))
 
-    items.sort(key=lambda t: (-t[1], -t[2], t[0]))
+    items.sort(key=lambda t: (-t[1], -t[2], t[0].lower()))
     return items[:n] if n is not None else items
 
 
 def rank_movies_in_genre(store: DataStore, genre: str, n: Optional[int] = None) -> List[Tuple[str, float, int]]:
-    """Top movies in a given genre ranked on average rating.
-    
-    Args:
-        store: DataStore with movies and ratings
-        genre: The target genre
-        n: Optional top-N limit
-    
-    Returns:
-        A ranked list of (movie_name, avg_rating, num_ratings). Unrated movies are excluded.
-    """
-    genre_movies = list(store.movies_by_genre.get(genre, []))
+    """Top movies in a given genre ranked on average rating (genre match is case-insensitive)."""
+    genre_key = genre.lower()
+    genre_movies = list(store.movies_by_genre.get(genre_key, []))
     if not genre_movies:
         return []
     return rank_movies_by_average(store, movie_names=genre_movies, n=n)
@@ -234,106 +223,76 @@ def rank_movies_in_genre(store: DataStore, genre: str, n: Optional[int] = None) 
 def rank_genres_by_popularity(store: DataStore, n: Optional[int] = None) -> List[Tuple[str, float, int]]:
     """Rank genres by the average of movie-average-ratings within the genre.
     
-    For each genre:
-        - Compute the average rating for each rated movie in the genre.
-        - Take the mean of those movie averages to represent the genre's popularity.
-        - Genres with no rated movies are excluded.
-    
-    Args:
-        store: DataStore with movies and ratings
-        n: Optional top-N limit
-    
-    Returns:
-        A ranked list of (genre, genre_average, num_rated_movies_in_genre).
-        Sorted by genre_average desc, then num_rated_movies desc, then genre asc.
+    Returns display genres in their original casing.
     """
     results: List[Tuple[str, float, int]] = []
-    for genre, movie_names in store.movies_by_genre.items():
+    for genre_key, movie_keys in store.movies_by_genre.items():
         avgs = []
-        for name in movie_names:
-            avg = movie_average_rating(store, name)
+        for mkey in movie_keys:
+            avg = movie_average_rating(store, mkey)
             if avg is not None:
                 avgs.append(avg)
         if not avgs:
             continue
         genre_avg = statistics.fmean(avgs)
-        results.append((genre, genre_avg, len(avgs)))
+        # Use original-cased genre from any movie in this bucket
+        any_movie = store.movies_by_name.get(next(iter(movie_keys)))
+        disp_genre = any_movie.genre if any_movie else genre_key
+        results.append((disp_genre, genre_avg, len(avgs)))
 
-    results.sort(key=lambda t: (-t[1], -t[2], t[0]))
+    results.sort(key=lambda t: (-t[1], -t[2], t[0].lower()))
     return results[:n] if n is not None else results
 
 
 def user_top_genre(store: DataStore, user_id: str) -> Optional[Tuple[str, float, int]]:
-    """Determine the user's most preferred genre, using their own ratings.
-    
-    For each genre, compute the average of the ratings that THIS user has given to 
-    movies in that genre. Return the genre with the highest average.
-    
-    Tie-breakers:
-      1) More movies rated in that genre (desc)
-      2) Genre name ascending
-    
-    Args:
-        store: DataStore with movies and ratings
-        user_id: The user's ID to evaluate
-    
-    Returns:
-        (genre, user_avg_for_genre, count_movies_rated_in_genre) or None if user has no ratings.
-    """
+    """Determine the user's most preferred genre (case-insensitive, uses user's own ratings)."""
     per_user = store.user_ratings.get(user_id)
     if not per_user:
         return None
 
     by_genre: Dict[str, List[float]] = {}
-    for name, rating in per_user.items():
-        movie = store.movies_by_name.get(name)
+    for mkey, rating in per_user.items():
+        movie = store.movies_by_name.get(mkey)
         if movie is None:
-            # Movie not present in movies list -> can't infer genre for this one
             continue
-        by_genre.setdefault(movie.genre, []).append(rating)
+        gkey = movie.genre.lower()
+        by_genre.setdefault(gkey, []).append(rating)
 
     if not by_genre:
         return None
 
-    rows: List[Tuple[str, float, int]] = []
-    for genre, ratings in by_genre.items():
-        rows.append((genre, statistics.fmean(ratings), len(ratings)))
+    rows: List[Tuple[str, float, int, str]] = []
+    for gkey, ratings in by_genre.items():
+        any_movie = store.movies_by_name.get(next(iter(store.movies_by_genre.get(gkey, {""}))))
+        disp_genre = any_movie.genre if any_movie else gkey
+        rows.append((disp_genre, statistics.fmean(ratings), len(ratings), gkey))
 
-    rows.sort(key=lambda t: (-t[1], -t[2], t[0]))
-    return rows[0]
+    rows.sort(key=lambda t: (-t[1], -t[2], t[3]))  # sort by avg desc, count desc, genre_key asc
+    best = rows[0]
+    return (best[0], best[1], best[2])
 
 
 def recommend_for_user(store: DataStore, user_id: str, k: int = 3) -> List[Tuple[str, float, int, str]]:
     """Recommend up to k movies for the user.
     
-    Strategy (per spec):
+    Strategy:
       - Find the user's top genre (by their own average ratings).
       - Within that genre, rank movies by overall popularity (average rating).
       - Recommend the top k that the user has NOT yet rated.
-    
-    Args:
-        store: DataStore
-        user_id: The target user
-        k: Number of recommendations to return (default 3)
-    
-    Returns:
-        A list of tuples (movie_name, avg_rating, num_ratings, genre).
-        Returns an empty list if user has no ratings or if no eligible recommendations exist.
     """
     top = user_top_genre(store, user_id)
     if not top:
         return []
-    genre, _, _ = top
+    disp_genre, _, _ = top
+    genre_key = disp_genre.lower()
 
-    # Movies user already rated
     rated = set(store.user_ratings.get(user_id, {}).keys())
-
-    ranked = rank_movies_in_genre(store, genre=genre, n=None)
+    ranked = rank_movies_in_genre(store, genre=genre_key, n=None)
     recs: List[Tuple[str, float, int, str]] = []
-    for name, avg, cnt in ranked:
-        if name in rated:
+    for disp_name, avg, cnt in ranked:
+        if disp_name.lower() in rated:
             continue
-        recs.append((name, avg, cnt, genre))
+        recs.append((disp_name, avg, cnt, disp_genre))
         if len(recs) >= k:
             break
     return recs
@@ -408,11 +367,10 @@ def print_recommendations(rows: List[Tuple[str, float, int, str]], user_id: str)
 
 def main() -> None:
     store = DataStore()
-    movies_loaded = False
-    ratings_loaded = False
 
     print("=== Movie Recommender (CLI) ===")
     print("Python", sys.version.split()[0])
+    print("Note: Movie names and genres are matched case-insensitively.")
     while True:
         print("\nMenu:")
         print(" 1) Load movies file")
@@ -430,7 +388,6 @@ def main() -> None:
             path = input("Enter path to movies file: ").strip()
             try:
                 n = load_movies_file(path, store)
-                movies_loaded = True
                 print(f"Loaded {n} movies from '{path}'.")
             except FileNotFoundError:
                 print(f"File not found: {path}")
@@ -441,8 +398,7 @@ def main() -> None:
             path = input("Enter path to ratings file: ").strip()
             try:
                 n = load_ratings_file(path, store)
-                ratings_loaded = True
-                print(f"Loaded {n} ratings from '{path}'.")
+                print(f"Loaded {n} unique user/movie ratings from '{path}'.")
             except FileNotFoundError:
                 print(f"File not found: {path}")
             except Exception as e:
@@ -490,7 +446,6 @@ def main() -> None:
 
         elif choice == "8":
             store.clear()
-            movies_loaded = ratings_loaded = False
             print("Cleared all loaded data.")
 
         elif choice == "9":
@@ -503,3 +458,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
